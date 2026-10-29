@@ -59,7 +59,37 @@ If you want to count from the opposite direction you can use a negative position
 msg.find("MSH.-1") # -> The last position on the MSH segment: 2.3
 ```
 
+MSH is numbered as in the HL7 spec: `MSH.1` is the field separator and `MSH.2` the encoding characters.
+
+```python
+msg.find("MSH.1")   # -> |
+msg.find("MSH.2")   # -> ^~\&
+msg.find("MSH.3")   # -> SendingApp
+msg.find("MSH.9.1") # -> ORU
+```
+
+Subcomponents can be used without components, as HL7 allows (e.g. a name of `&Whitaker&Emily` is component 1 split into subcomponents):
+
+```python
+msg.find("OBR.32.1.2") # -> Whitaker for OBR|...|&Whitaker&Emily|...
+```
+
+A plain value is its own first component, so `PID.1.1` is the same as `PID.1` when PID.1 has no components.
+
 If there is a repeating field or segment but your search string is ambiguous it will raise `HL7AmbiguousSegmentException`.
+
+### Missing locations and strict mode
+
+Searching for a location that isn't in the message (a missing segment, a position past the end of a field, etc.) returns `None`. With repeating segments each segment gets its own value (`msg.find("OBX*.99")` -> `[None, None, ...]`).
+
+To raise instead, use strict mode. It raises `HL7LocationNotFoundException`, a subclass of `IndexError`:
+
+```python
+msg = HL7Message(hl7_string, strict=True)
+msg.find("ZZZ.1") # -> raises HL7LocationNotFoundException
+```
+
+`raise_on_index=True` is still accepted as the older name for `strict=True`.
 
 ### Update
 
@@ -68,8 +98,8 @@ Components of the HL7 message can be changed using the same find syntax. The one
 To change a field value just reference it and provide the updated value:
 
 ```python
-msg.update("MSH.2","New Facility")
-msg.find("MSH.2") # -> "New Facility"
+msg.update("MSH.4","New Facility")
+msg.find("MSH.4") # -> "New Facility"
 
 msg.update("PID.-1","last element")
 msg.find("PID.-1") # -> "last element"

@@ -1,4 +1,3 @@
-from functools import reduce
 import re
 
 class InvalidHL7FindSyntaxException(Exception):
@@ -18,54 +17,63 @@ class HL7UpdateAttemptTooDeep(Exception):
     def __init__(self, search_string):
         super().__init__(f"Attempt to set value at too deep a position given: {search_string}")
 
+# An IndexError so callers already catching IndexError (the old
+# raise_on_index behaviour) keep working
+class HL7LocationNotFoundException(IndexError):
+    def __init__(self, location):
+        super().__init__(f"Nothing found at location: {location}")
+
 class HL7Message:
     def __init__(self,message_string, **kwargs):
-        self._options = dict({'raise_on_ambiguous': True, 'raise_on_index': False},**kwargs)
+        self._options = dict({'raise_on_ambiguous': True, 'strict': False, 'raise_on_index': False},**kwargs)
+        # raise_on_index is the older name for strict
+        self._strict = self._options.get('strict') or self._options.get('raise_on_index')
         self._parsing_elements = list(message_string[3:8])
         self._escape = self._parsing_elements[3]
         self._repeating = self._parsing_elements[2]
         self._delimeters = [self._parsing_elements[0],self._parsing_elements[1],self._parsing_elements[4]]
         self._segments = message_string.splitlines()
-        self._internal_structure = list(map(lambda seg: (seg[:3], self._parse(seg,self._delimeters)[1:]), self._segments))
-        # fix MSH.1 with values for field separator otherwise parsing turns it into a repeating field with wonky values
-        fixed_msh = self._internal_structure[0][1][1:]
-        fixed_msh.insert(0,f"{self._delimeters[1]}{self._repeating}{self._escape}{self._delimeters[2]}")
+        self._internal_structure = list(map(lambda seg: (seg[:3], self._parse_segment(seg)), self._segments))
+        # MSH.1 is the field separator itself and MSH.2 the encoding
+        # characters, so neither can be parsed like the rest of the fields
+        msh_fields = self._internal_structure[0][1]
+        fixed_msh = [self._delimeters[0], ''.join(self._parsing_elements[1:5])] + msh_fields[1:]
         self._internal_structure[0] = (self._internal_structure[0][0], fixed_msh)
 
 
     # Segment splitting is handled above
-    # This handles splitting based on the delimeters specified
+    # These handle splitting based on the delimeters specified
     # in the MSH segment into lists and the grouping of repeating
     # fields into tuples.
     # Using tuples to distinguish repeating fields is vital for
     # the wildcare find syntax used below (e.g. ZF1.4*.1 which returns
     # the first sub element of the ZF1.4 repeating field)
-    def _parse(self,part,given_delimeters):
-        dels = given_delimeters.copy()
-        if len(given_delimeters) == 0:
-            return part
-        else:
-            current_del = dels.pop(0) #dels now the rest
-            n_parts = part.split(current_del)
-            # Assumes there will always be at least one delimerter at the top level (which meets the spec)
-            if len(n_parts) == 1 and len(given_delimeters) < 3: # Not the first delimeter
-                return self._repeat_split(part)
-            elif len(given_delimeters) < 3:
-                # look for repeating fields before splitting
-                repititions = self._repeat_split(part)
-                if type(repititions) is tuple:
-                    return tuple(map(lambda rep: list(map(lambda p: self._parse(p,dels), rep.split(current_del))), repititions))
-                else:
-                    return list(map(lambda p: self._parse(p,dels), n_parts))
-            else:
-                return list(map(lambda p: self._parse(p,dels), n_parts))
+    def _parse_segment(self,segment):
+        return list(map(self._parse_field, segment.split(self._delimeters[0])[1:]))
 
-    def _repeat_split(self,part):
-        repititions = part.split(self._repeating)
+    def _parse_field(self,field):
+        repititions = field.split(self._repeating)
         if len(repititions) > 1:
-            return tuple(repititions)
+            return tuple(map(self._parse_components, repititions))
         else:
-            return part
+            return self._parse_components(field)
+
+    # A value only stays a plain string when it uses no deeper delimeter at
+    # all. Subcomponents without components (e.g. "&Whitaker&Emily") are
+    # valid HL7 and are component 1 split into subcomponents.
+    def _parse_components(self,value):
+        component, subcomponent = self._delimeters[1], self._delimeters[2]
+        if component not in value and subcomponent not in value:
+            return value
+        else:
+            return list(map(self._parse_subcomponents, value.split(component)))
+
+    def _parse_subcomponents(self,value):
+        subcomponent = self._delimeters[2]
+        if subcomponent in value:
+            return value.split(subcomponent)
+        else:
+            return value
 
     def segments(self):
         return self._segments
@@ -87,7 +95,12 @@ class HL7Message:
             else:
                 return hl7list
 
-        return newline_char.join(map(lambda seg_tuple: f"{seg_tuple[0]}{self._delimeters[0]}{list_to_string(seg_tuple[1],self._delimeters)}",
+        # MSH.1 is the field separator that's emitted after the segment name anyway
+        def segment_to_string(name, fields):
+            fields = fields[1:] if name == 'MSH' else fields
+            return f"{name}{self._delimeters[0]}{list_to_string(fields,self._delimeters)}"
+
+        return newline_char.join(map(lambda seg_tuple: segment_to_string(*seg_tuple),
                                      self._internal_structure))
 
     def find(self,search_string):
@@ -101,23 +114,30 @@ class HL7Message:
                 position = self._find_with_int(position,token)
             return position
 
+        # A location that isn't there is None unless in strict mode
+        def guarded(search, *args):
+            try:
+                return search(*args)
+            except HL7LocationNotFoundException:
+                if self._strict:
+                    raise HL7LocationNotFoundException(search_string)
+                return None
+
         # Handle segment selection differently because of the
         # (segment name, list) setup in self._internal_structure
         tokenized_search = search_string.split(".")
         segment_token = tokenized_search.pop(0)
-        (_,position) = self._find_segment(segment_token)
+        found = guarded(self._find_segment, segment_token)
+        if found is None:
+            return None
+        (_,position) = found
 
-        # special case repeat segment handling
+        # special case repeat segment handling, each segment is guarded on
+        # its own so one missing value doesn't hide the others
         if type(position) == tuple:
-            position = map(lambda seg: token_search(seg, tokenized_search), position)
+            return list(map(lambda seg: guarded(token_search, seg, tokenized_search), position))
         else:
-            position = token_search(position, tokenized_search)
-
-        # Forcing evaluation just in case
-        if type(position) in [map, filter, reduce]:
-            return list(position)
-        else:
-            return position
+            return guarded(token_search, position, tokenized_search)
 
     # The primary difference in these finds is segments is a tuple
     # and the search string is alphanumeric instead of a number
@@ -130,44 +150,54 @@ class HL7Message:
             match = re.match(r"^([A-Z]{3})\[(\d+)\]$",token)
             seg_value = match.groups()[0]
             index = self._hl7_index_to_index(int(match.groups()[1]))
-            seg_index = [i for i,seg in filter(lambda i_seg: i_seg[1][0] == seg_value, enumerate(self._internal_structure))][index]
-            segment = list(filter(lambda seg: seg[0] == seg_value, self._internal_structure))[index][1]
+            seg_index = self._index([i for i,seg in filter(lambda i_seg: i_seg[1][0] == seg_value, enumerate(self._internal_structure))], index, token)
+            segment = self._internal_structure[seg_index][1]
             return (seg_index, segment)
         else:
             segments = list(filter(lambda seg: seg[0] == token, self._internal_structure))
-            if len(segments) > 1 and self._options.get('raise_on_ambiguous'):
+            if len(segments) == 0:
+                raise HL7LocationNotFoundException(token)
+            elif len(segments) > 1 and self._options.get('raise_on_ambiguous'):
                 raise HL7AmbiguousSegmentException(f"There is more than one {token} segment")
             else:
                 index = [i for i,seg in filter(lambda i_seg: i_seg[1][0] == token, enumerate(self._internal_structure))]
                 return (index[0],segments[0][1])
 
     def _find_with_int(self,position, token):
+        if type(position) == tuple: # Return of a repeating set
+            return tuple(map(lambda p: self._find_with_int(p,token), position))
+        if token[-1] == ']':
+            match = re.match(r"^(\d+)\[(\d+)\]$",token)
+            seg_index = self._hl7_index_to_index(int(match.groups()[0]))
+            repeating_index = self._hl7_index_to_index(int(match.groups()[1]))
+            field = self._index(position, seg_index, token)
+            # A field that doesn't repeat is its own first repetition
+            repititions = field if type(field) is tuple else (field,)
+            return self._index(repititions, repeating_index, token)
+        elif token[-1] == '*':
+            index = self._hl7_index_to_index(int(token[:-1]))
+            seg = self._index(position, index, token)
+            return seg if type(seg) is tuple else (seg,)
+        else:
+            index = self._hl7_index_to_index(int(token))
+            seg = self._index(position, index, token)
+            if type(seg) in [tuple] and self._options.get('raise_on_ambiguous') and token[-1] != '*':
+                raise HL7AmbiguousSegmentException(f"There is more than one value for segment {token} in {position}")
+            else:
+                return seg
+
+    # A plain string is a value with only one component (in HL7 "Smith"
+    # is the same as "Smith^"), so its first (or last) position is itself
+    # rather than a character of it
+    def _index(self,position, index, token):
+        if type(position) is str:
+            if index in [0, -1]:
+                return position
+            raise HL7LocationNotFoundException(token)
         try:
-            if type(position) == tuple: # Return of a repeating set
-                return tuple(map(lambda p: self._find_with_int(p,token), position))
-            if token[-1] == ']':
-                match = re.match(r"^(\d+)\[(\d+)\]$",token)
-                seg_index = self._hl7_index_to_index(int(match.groups()[0]))
-                repeating_index = self._hl7_index_to_index(int(match.groups()[1]))
-                # Could run check to see if postion[seg_index] is a tuple and raise accordingly
-                return list(position)[seg_index][repeating_index]
-            elif token[-1] == '*':
-                index = self._hl7_index_to_index(int(token[:-1]))
-                seg = position[index]
-                return tuple(seg)
-            else:
-                #index = int(token[:-1]) if token[-1] == '*' else int(token)
-                index = self._hl7_index_to_index(int(token))
-                seg = position[index]
-                if type(seg) in [tuple] and self._options.get('raise_on_ambiguous') and token[-1] != '*':
-                    raise HL7AmbiguousSegmentException(f"There is more than one value for segment {token} in {position}")
-                else:
-                    return seg
-        except IndexError as e:
-            if self._options.get('raise_on_index'):
-                raise e
-            else:
-                return None
+            return position[index]
+        except IndexError:
+            raise HL7LocationNotFoundException(token)
 
     def _hl7_index_to_index(self,given_int):
         if given_int == 0:

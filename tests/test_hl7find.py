@@ -19,7 +19,7 @@ class TestHL7Message(unittest.TestCase):
         self.assertTrue('MSH' in map(lambda t: t[0], self.msg.internal_structure()))
 
     def test_shallow_simple_find(self):
-        self.assertEqual(self.msg.find("MSH.2"),"SendingApp")
+        self.assertEqual(self.msg.find("MSH.3"),"SendingApp")
         self.assertEqual(self.msg.find("PID.3.4.3"),"ISO")
 
     def test_negative_index(self):
@@ -40,7 +40,7 @@ class TestHL7Message(unittest.TestCase):
         with self.assertRaises(hl7find.HL7AmbiguousSegmentException):
             self.msg.find("ZF1.2")
         self.assertEqual(self.msg.find("ZF1.2*"),('REPEAT 1','REPEAT 2','REPEAT 3'))
-        self.assertEqual(self.msg.find("ZF1.2*.1"),('R','R','R'));
+        self.assertEqual(self.msg.find("ZF1.2*.1"),('REPEAT 1','REPEAT 2','REPEAT 3'));
         self.assertEqual(self.msg.find("ZF1.2[2]"),('REPEAT 2'));
 
     def test_repeating_segment_and_field(self):
@@ -75,8 +75,8 @@ class TestHL7Message(unittest.TestCase):
         self.assertEqual(self.msg.find("PID.2.2"),"John")
 
     def test_basic_update(self):
-        self.msg.update("MSH.2","New Sending Facility")
-        self.assertEqual(self.msg.find("MSH.2"),"New Sending Facility")
+        self.msg.update("MSH.4","New Sending Facility")
+        self.assertEqual(self.msg.find("MSH.4"),"New Sending Facility")
 
         self.msg.update("PID.3.4.1","Pants")
         self.assertEqual(self.msg.find("PID.3.4.1"),"Pants")
@@ -97,7 +97,7 @@ class TestHL7Message(unittest.TestCase):
 
     def test_exceptions_on_update(self):
         with self.assertRaises(hl7find.HL7UpdateAttemptTooDeep):
-            self.msg.update("MSH.2.1","test")
+            self.msg.update("MSH.3.1","test")
         with self.assertRaises(hl7find.InvalidHL7FindSyntaxException):
             self.msg.update("OBX*.1","test")
 
@@ -114,6 +114,45 @@ class TestHL7Message(unittest.TestCase):
     def test_raise_index_error(self):
         with self.assertRaises(IndexError):
             self.loud_msg.find('MSH.100')
+
+    def test_missing_locations_are_none(self):
+        self.assertEqual(self.msg.find('ZZZ.1'),None)
+        self.assertEqual(self.msg.find('OBX[99].1'),None)
+        self.assertEqual(self.msg.find('PID.99.1'),None)
+        self.assertEqual(self.msg.find('PID.1.2'),None)
+        self.assertEqual(self.msg.find('OBX*.99'),[None] * 14)
+        self.assertEqual(self.msg.find('ZZZ*.1'),[])
+
+    def test_strict_mode(self):
+        strict_msg = hl7find.HL7Message(self.hl7_string,strict=True)
+        for location in ['ZZZ.1','OBX[99].1','PID.99.1','PID.1.2','OBX*.99']:
+            with self.assertRaises(hl7find.HL7LocationNotFoundException):
+                strict_msg.find(location)
+        with self.assertRaises(IndexError):
+            strict_msg.find('ZZZ.1')
+
+    def test_plain_value_is_its_own_first_component(self):
+        self.assertEqual(self.msg.find('PID.1.1'),'1')
+        self.assertEqual(self.msg.find('PID.1.-1'),'1')
+        self.assertEqual(self.msg.find('PID.1*'),('1',))
+
+    def test_msh_numbering(self):
+        self.assertEqual(self.msg.find('MSH.1'),'|')
+        self.assertEqual(self.msg.find('MSH.2'),'^~\\&')
+        self.assertEqual(self.msg.find('MSH.3'),'SendingApp')
+        self.assertEqual(self.msg.find('MSH.9.1'),'ORU')
+        self.assertEqual(self.msg.find('MSH.-1'),'2.3')
+
+    def test_subcomponents_without_components(self):
+        hl7_string = "\r".join([
+            "MSH|^~\\&|gene|org2|BUTTERFLY|BUTTERFLY|20261029144059||ORM^O01^ORM_O01|1|P|2.5.1",
+            "OBR|1|o1|fo1|RAD002^Abdominal X-Ray|&Whitaker&Dr. Emily|a&b~c&d"])
+        msg = hl7find.HL7Message(hl7_string)
+        self.assertEqual(msg.find('OBR.5.1.2'),'Whitaker')
+        self.assertEqual(msg.find('OBR.5.1.3'),'Dr. Emily')
+        self.assertEqual(msg.find('OBR.5.2'),None)
+        self.assertEqual(msg.find('OBR.6*.1.2'),('b','d'))
+        self.assertEqual(msg.to_string(newline_char='\r'),hl7_string)
 
 if __name__ == '__main__':
     unittest.main()
